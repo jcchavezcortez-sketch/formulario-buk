@@ -1,5 +1,7 @@
 // ===== CONFIGURACIÓN =====
-const CLICKUP_TOKEN = "pk_REDACTADO"; // [REDACTADO en el repo: el original tenía el token personal en texto plano]
+// El token de ClickUp NO va en el código: se guarda en Configuración del proyecto →
+// Propiedades del script → CLICKUP_TOKEN.
+const CLICKUP_TOKEN = PropertiesService.getScriptProperties().getProperty("CLICKUP_TOKEN");
 const LIST_ID = "1000280000010420";
 
 
@@ -31,7 +33,25 @@ const URL_PORTAL = "https://buk-portal-solicitudes-digital-co.vercel.app";
 
 // ===== FUNCIÓN PRINCIPAL: se activa cuando alguien envía el Form =====
 function onFormSubmit(e) {
-  const formResponse = e.response;
+  try {
+    procesarRespuesta(e.response);
+  } catch (err) {
+    // Sin esto, si ClickUp falla la solicitud se pierde en silencio.
+    Logger.log("❌ Error procesando respuesta: " + err + "\n" + err.stack);
+    MailApp.sendEmail(
+      Session.getEffectiveUser().getEmail(),
+      "❌ Error en el formulario de Solicitudes Digital Colombia",
+      "No se pudo procesar una respuesta del formulario.\n\n" +
+      "Error: " + err + "\n\n" +
+      "Correo del solicitante: " + (e.response ? e.response.getRespondentEmail() : "desconocido") + "\n\n" +
+      "Revisa las ejecuciones en Apps Script y crea la tarea a mano si es necesario."
+    );
+    throw err;
+  }
+}
+
+
+function procesarRespuesta(formResponse) {
   const itemResponses = formResponse.getItemResponses();
 
 
@@ -75,6 +95,7 @@ function onFormSubmit(e) {
 
 
   const tareaCreada = crearTareaClickUp({
+    nombreTarea: nombreTarea,
     correo: correo,
     areaSolicita: areaSolicita,
     esColombia: esColombia,
@@ -137,9 +158,6 @@ function crearTareaClickUp(datos) {
   const url = "https://api.clickup.com/api/v2/list/" + LIST_ID + "/task";
 
 
-  const nombreTarea = "Colombia - " + datos.areaDigital + " - " + datos.tipoSolicitud;
-
-
   const descripcionCompleta =
     "Descripción: " + datos.descripcion + "\n\n" +
     "Detalles técnicos: " + (datos.detallesTecnicos || "N/A") + "\n\n" +
@@ -151,19 +169,19 @@ function crearTareaClickUp(datos) {
   const areaOptionId = AREA_OPTION_IDS[datos.areaDigital.trim().toUpperCase()] || null;
 
 
+  // Solo se envían los campos con valor: un valor vacío en un custom field
+  // puede hacer que ClickUp rechace la creación de toda la tarea.
   const customFields = [
     { id: CAMPOS.SOLICITANTE, value: datos.correo },
     { id: CAMPOS.OBJETIVO, value: datos.objetivo },
     { id: CAMPOS.FORMATO, value: datos.formato },
-    { id: CAMPOS.AREA_SOLICITA, value: datos.areaSolicita || "" }
-  ];
-  if (areaOptionId) {
-    customFields.push({ id: CAMPOS.AREA, value: areaOptionId });
-  }
+    { id: CAMPOS.AREA_SOLICITA, value: datos.areaSolicita },
+    { id: CAMPOS.AREA, value: areaOptionId }
+  ].filter(function(campo) { return campo.value; });
 
 
   const payload = {
-    name: nombreTarea,
+    name: datos.nombreTarea,
     description: descripcionCompleta,
     assignees: asignados,
     custom_fields: customFields
@@ -186,14 +204,30 @@ function crearTareaClickUp(datos) {
 
 
   const respuesta = UrlFetchApp.fetch(url, opciones);
-  Logger.log("Respuesta de ClickUp: " + respuesta.getContentText());
+  const codigo = respuesta.getResponseCode();
+  Logger.log("Respuesta de ClickUp (" + codigo + "): " + respuesta.getContentText());
 
+  if (codigo < 200 || codigo >= 300) {
+    throw new Error("ClickUp respondió " + codigo + " al crear la tarea: " + respuesta.getContentText());
+  }
 
   return JSON.parse(respuesta.getContentText());
 }
 
 
+// Escapa texto que viene del formulario antes de meterlo en el HTML del correo.
+function escaparHtml(texto) {
+  return String(texto)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+
 // ===== PLANTILLA HTML BASE (identidad Buk) =====
+// Nota: opts.area se escapa aquí; en saludo/mensaje/detalles el texto del formulario
+// debe pasarse ya escapado con escaparHtml().
 function construirEmailHtml(opts) {
   const pillColors = {
     asignacion: { bg: BRAND.azulPalido, text: BRAND.azulMedio, label: "📋 Nueva asignación" },
@@ -212,7 +246,7 @@ function construirEmailHtml(opts) {
 
 
   const areaTagHtml = opts.area
-    ? '<span style="background-color:' + BRAND.azul + ';color:#ffffff;font-size:11px;font-weight:bold;padding:3px 10px;border-radius:20px;">' + opts.area + '</span>'
+    ? '<span style="background-color:' + BRAND.azul + ';color:#ffffff;font-size:11px;font-weight:bold;padding:3px 10px;border-radius:20px;">' + escaparHtml(opts.area) + '</span>'
     : "";
 
 
@@ -286,11 +320,11 @@ function notificarAsignados(tareaCreada, nombreTarea, areaDigital) {
 
     const htmlBody = construirEmailHtml({
       tipo: "asignacion",
-      saludo: "Hola, " + asignado.username + "!",
+      saludo: "Hola, " + escaparHtml(asignado.username) + "!",
       mensaje: "Se te asignó una nueva solicitud en el tablero de Digital Colombia.",
       area: areaDigital,
       detalles: [
-        { label: "Tarea", valor: "<b>" + nombreTarea + "</b>" }
+        { label: "Tarea", valor: "<b>" + escaparHtml(nombreTarea) + "</b>" }
       ],
       botonUrl: urlTarea,
       botonTexto: "Ver tarea en ClickUp"
@@ -312,28 +346,63 @@ function notificarAsignados(tareaCreada, nombreTarea, areaDigital) {
 
 
 // ===== CORREOS EXENTOS DE LA VALIDACIÓN DE FECHA =====
-// [REDACTADO en el repo: el original tenía aquí 4 correos @buk.co del equipo]
-const CORREOS_SIN_MINIMO_DIAS = [
-  "persona1@buk.co",
-  "persona2@buk.co",
-  "persona3@buk.co",
-  "persona4@buk.co"
-];
+// Se configuran en Propiedades del script → CORREOS_EXENTOS, separados por coma
+// (ej: "persona1@buk.co,persona2@buk.co"). Así no quedan publicados en el repo.
+function obtenerCorreosExentos() {
+  const valor = PropertiesService.getScriptProperties().getProperty("CORREOS_EXENTOS") || "";
+  return valor.split(",")
+    .map(function(c) { return c.trim().toLowerCase(); })
+    .filter(function(c) { return c; });
+}
 
 
 function estaExentoDeMinimoDias(correo) {
   if (!correo) return false;
-  return CORREOS_SIN_MINIMO_DIAS.indexOf(correo.trim().toLowerCase()) !== -1;
+  return obtenerCorreosExentos().indexOf(correo.trim().toLowerCase()) !== -1;
 }
 
 
-// ===== FESTIVOS OFICIALES DE COLOMBIA 2026 =====
-const FESTIVOS_COLOMBIA_2026 = [
-  "2026-01-01", "2026-01-12", "2026-03-23", "2026-04-02", "2026-04-03",
-  "2026-05-01", "2026-05-18", "2026-06-08", "2026-06-15", "2026-06-29",
-  "2026-07-13", "2026-07-20", "2026-08-07", "2026-08-17", "2026-10-12",
-  "2026-11-02", "2026-11-16", "2026-12-08", "2026-12-25"
-];
+// ===== FESTIVOS OFICIALES DE COLOMBIA (cualquier año) =====
+// Se calculan en vez de listarse a mano, para que el script siga funcionando en 2027+.
+// Reglas: Ley 51 de 1983 (Ley Emiliani) — algunos festivos se trasladan al lunes siguiente.
+const cacheFestivos = {};
+
+// Domingo de Pascua (algoritmo anónimo gregoriano). Devuelve [mes, día].
+function calcularPascua(anio) {
+  const a = anio % 19, b = Math.floor(anio / 100), c = anio % 100;
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  return [Math.floor((h + l - 7 * m + 114) / 31), ((h + l - 7 * m + 114) % 31) + 1];
+}
+
+function obtenerFestivosColombia(anio) {
+  if (cacheFestivos[anio]) return cacheFestivos[anio];
+
+  // Se usa UTC solo como "calendario" para sumar días sin problemas de zona horaria.
+  function fecha(mes, dia) { return new Date(Date.UTC(anio, mes - 1, dia)); }
+  function sumarDias(f, n) { return new Date(f.getTime() + n * 24 * 60 * 60 * 1000); }
+  function aLunes(f) { return sumarDias(f, (8 - f.getUTCDay()) % 7); }
+  function texto(f) { return f.toISOString().slice(0, 10); }
+
+  const pascuaMD = calcularPascua(anio);
+  const pascua = fecha(pascuaMD[0], pascuaMD[1]);
+
+  const festivos = [
+    // Fijos
+    fecha(1, 1), fecha(5, 1), fecha(7, 20), fecha(8, 7), fecha(12, 8), fecha(12, 25),
+    // Trasladables al lunes
+    aLunes(fecha(1, 6)), aLunes(fecha(3, 19)), aLunes(fecha(6, 29)), aLunes(fecha(8, 15)),
+    aLunes(fecha(10, 12)), aLunes(fecha(11, 1)), aLunes(fecha(11, 11)),
+    // Dependientes de Pascua
+    sumarDias(pascua, -3), sumarDias(pascua, -2),   // Jueves y Viernes Santo
+    sumarDias(pascua, 43), sumarDias(pascua, 64), sumarDias(pascua, 71) // Ascensión, Corpus, Sagrado Corazón (lunes)
+  ];
+
+  cacheFestivos[anio] = festivos.map(texto);
+  return cacheFestivos[anio];
+}
 
 
 function esFestivoOFinDeSemana(fecha) {
@@ -342,7 +411,7 @@ function esFestivoOFinDeSemana(fecha) {
 
 
   const fechaTexto = Utilities.formatDate(fecha, Session.getScriptTimeZone(), "yyyy-MM-dd");
-  return FESTIVOS_COLOMBIA_2026.includes(fechaTexto);
+  return obtenerFestivosColombia(Number(fechaTexto.slice(0, 4))).indexOf(fechaTexto) !== -1;
 }
 
 
@@ -381,6 +450,16 @@ function obtenerSiguienteDiaHabil(fecha) {
 
 // ===== VALIDACIÓN ÚNICA DE FECHA: envía SOLO uno de los dos correos posibles =====
 function validarYNotificarSolicitante(fechaEntregaTexto, correoSolicitante, nombreTarea, tareaCreada, areaDigital) {
+  if (!correoSolicitante) {
+    Logger.log("⚠️ La respuesta no trae correo (¿el Form tiene activado \"Recopilar correos\"?). No se notifica al solicitante.");
+    return;
+  }
+  if (!fechaEntregaTexto) {
+    // Sin fecha, new Date("T12:00...") es inválida y Utilities.formatDate revienta.
+    Logger.log("⚠️ La respuesta no trae fecha de entrega. Se omite la validación de fecha.");
+    return;
+  }
+
   const fechaSolicitada = new Date(fechaEntregaTexto + "T12:00:00-05:00");
   fechaSolicitada.setHours(0, 0, 0, 0);
 
@@ -389,9 +468,6 @@ function validarYNotificarSolicitante(fechaEntregaTexto, correoSolicitante, nomb
   const exento = estaExentoDeMinimoDias(correoSolicitante);
   const cayoEnFestivoOFinde = esFestivoOFinDeSemana(fechaSolicitada) && !exento;
   const noCumpleMinimo = (fechaSolicitada < fechaMinima) && !exento;
-
-
-  const urlTarea = (tareaCreada && tareaCreada.url) ? tareaCreada.url : "";
 
 
   if (cayoEnFestivoOFinde || noCumpleMinimo) {
@@ -417,7 +493,7 @@ function validarYNotificarSolicitante(fechaEntregaTexto, correoSolicitante, nomb
     const htmlBody = construirEmailHtml({
       tipo: "ajuste",
       saludo: "¡Hola!",
-      mensaje: "Recibimos tu solicitud \"" + nombreTarea + "\". " + motivoTexto + " Tu solicitud ya fue registrada, pero te contactaremos para ajustar el plazo o revisar la prioridad.",
+      mensaje: "Recibimos tu solicitud \"" + escaparHtml(nombreTarea) + "\". " + motivoTexto + " Tu solicitud ya fue registrada, pero te contactaremos para ajustar el plazo o revisar la prioridad.",
       area: areaDigital,
       detalles: [
         { label: "Fecha solicitada", valor: Utilities.formatDate(fechaSolicitada, Session.getScriptTimeZone(), "dd/MM/yyyy") },
@@ -452,7 +528,7 @@ function validarYNotificarSolicitante(fechaEntregaTexto, correoSolicitante, nomb
       mensaje: "Tu solicitud fue recibida correctamente y ya está siendo gestionada por el equipo Digital Colombia.",
       area: areaDigital,
       detalles: [
-        { label: "Tarea", valor: "<b>" + nombreTarea + "</b>" },
+        { label: "Tarea", valor: "<b>" + escaparHtml(nombreTarea) + "</b>" },
         { label: "Fecha de entrega", valor: Utilities.formatDate(fechaSolicitada, Session.getScriptTimeZone(), "dd/MM/yyyy") }
       ],
       botonUrl: URL_PORTAL,
@@ -521,7 +597,10 @@ function revisarTareasVencidas() {
 
   tareas.forEach(function (t) {
     const estado = (t.status && t.status.status ? t.status.status : "").toLowerCase();
-    const completada = estado.indexOf("entreg") !== -1 || estado.indexOf("cerr") !== -1;
+    const tipoEstado = t.status && t.status.type ? t.status.type : "";
+    // type "closed"/"done" cubre los estados finales aunque se renombren en ClickUp.
+    const completada = tipoEstado === "closed" || tipoEstado === "done" ||
+      estado.indexOf("entreg") !== -1 || estado.indexOf("cerr") !== -1;
     if (completada) return;
     if (!t.due_date) return;
 
@@ -632,9 +711,13 @@ function obtenerTodasLasTareasClickUp() {
       muteHttpExceptions: true
     };
     const respuesta = UrlFetchApp.fetch(url, opciones);
+    if (respuesta.getResponseCode() !== 200) {
+      throw new Error("ClickUp respondió " + respuesta.getResponseCode() + " al listar tareas: " + respuesta.getContentText());
+    }
     const datos = JSON.parse(respuesta.getContentText());
-    todas = todas.concat(datos.tasks || []);
-    hayMas = datos.tasks && datos.tasks.length === 100;
+    const tareasPagina = datos.tasks || [];
+    todas = todas.concat(tareasPagina);
+    hayMas = tareasPagina.length > 0 && datos.last_page !== true;
     page++;
   }
 
